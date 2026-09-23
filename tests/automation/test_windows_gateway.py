@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from faktura_pilot.automation.models import (
@@ -28,6 +30,38 @@ class FakeApplication:
 
     def windows(self):
         return [self.window]
+
+
+class RecordingApplication:
+    def __init__(self, window, *, connect_error=None):
+        self.window = window
+        self.connect_error = connect_error
+        self.connect_calls = []
+        self.start_calls = []
+
+    def connect(self, **kwargs):
+        self.connect_calls.append(kwargs)
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    def start(self, executable, **kwargs):
+        self.start_calls.append((executable, kwargs))
+        if self.window is None:
+            self.window = FakeWindow()
+
+    def top_window(self):
+        return self.window
+
+    def windows(self):
+        return [self.window]
+
+
+class FakeDesktop:
+    def __init__(self, windows):
+        self._windows = windows
+
+    def windows(self):
+        return list(self._windows)
 
 
 def attached_gateway(window, *, timeout=0.03):
@@ -142,6 +176,249 @@ class WindowsGatewayTests(unittest.TestCase):
             gateway._main_window = window
 
             self.assertEqual(gateway._executable_version(), "2.2.0")
+
+    def test_version_walks_from_bundled_javaw_to_the_fakturama_install_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = Path(directory) / "Fakturama2"
+            javaw = install / "jre" / "bin" / "javaw.exe"
+            javaw.parent.mkdir(parents=True)
+            javaw.touch()
+            config = install / "configuration" / "org.eclipse.equinox.simpleconfigurator"
+            config.mkdir(parents=True)
+            (config / "bundles.info").write_text(
+                "com.sebulli.fakturama.rcp,2.2.0,plugins/com.sebulli.fakturama.rcp_2.2.0.jar,4,false\n",
+                encoding="utf-8",
+            )
+            window = FakeWindow()
+            window.process_path = str(javaw)
+            gateway = WindowsFakturamaGateway()
+            gateway._main_window = window
+
+            self.assertEqual(gateway._executable_version(), "2.2.0")
+
+    def test_configured_executable_is_used_as_version_fallback_after_title_attach(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = Path(directory)
+            executable = install / "Fakturama.exe"
+            executable.touch()
+            config = install / "configuration" / "org.eclipse.equinox.simpleconfigurator"
+            config.mkdir(parents=True)
+            (config / "bundles.info").write_text(
+                "com.sebulli.fakturama.rcp,2.2.0,plugins/com.sebulli.fakturama.rcp_2.2.0.jar,4,false\n",
+                encoding="utf-8",
+            )
+            window = FakeWindow()
+            window.process_path = None
+            gateway = WindowsFakturamaGateway()
+            gateway._main_window = window
+            gateway._configured_executable = executable
+
+            self.assertEqual(gateway._executable_version(), "2.2.0")
+
+    def test_version_reader_can_be_injected(self):
+        executable = Path("Fakturama.exe")
+        read_paths = []
+        gateway = WindowsFakturamaGateway(
+            version_reader=lambda path: read_paths.append(path) or "2.2.0"
+        )
+        gateway._configured_executable = executable
+
+        self.assertEqual(gateway._executable_version(), "2.2.0")
+        self.assertEqual(read_paths, [executable.resolve()])
+
+    def test_configured_install_version_is_reported_when_no_window_is_open(self):
+        executable = Path("Fakturama.exe")
+        gateway = WindowsFakturamaGateway(
+            app_factory=lambda **kwargs: None,
+            desktop_factory=lambda **kwargs: FakeDesktop([]),
+            version_reader=lambda path: "2.2.0" if path == executable.resolve() else None,
+        )
+
+        checks = gateway.diagnose(executable)
+
+        self.assertEqual(checks["Version"], "2.2.0")
+        self.assertEqual(checks["Window"], "no visible Fakturama window found")
+
+    def test_unrelated_protected_process_does_not_make_process_inventory_uncertain(self):
+        class FakePsutil:
+            class AccessDenied(Exception):
+                pass
+
+            class NoSuchProcess(Exception):
+                pass
+
+            @staticmethod
+            def process_iter(attrs):
+                unrelated = SimpleNamespace(info={"name": "MsMpEng.exe"})
+
+                def denied():
+                    raise FakePsutil.AccessDenied()
+
+                unrelated.exe = denied
+                unrelated.cmdline = denied
+                return [unrelated]
+
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "Fakturama.exe"
+            with patch.dict(sys.modules, {"psutil": FakePsutil}):
+                result = WindowsFakturamaGateway._default_process_exists_for_executable(
+                    executable
+                )
+
+        self.assertIs(result, False)
+
+    def test_candidate_java_process_access_denial_keeps_launch_check_uncertain(self):
+        class FakePsutil:
+            class AccessDenied(Exception):
+                pass
+
+            class NoSuchProcess(Exception):
+                pass
+
+            @staticmethod
+            def process_iter(attrs):
+                return [SimpleNamespace(info={"name": "javaw.exe"}, exe=denied)]
+
+        def denied():
+            raise FakePsutil.AccessDenied()
+
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "Fakturama.exe"
+            with patch.dict(sys.modules, {"psutil": FakePsutil}):
+                result = WindowsFakturamaGateway._default_process_exists_for_executable(
+                    executable
+                )
+
+        self.assertIsNone(result)
+
+    def test_visible_window_is_attached_by_handle_before_executable_path(self):
+        window = FakeWindow()
+        window.handle = 1234
+        window.process_id = 44
+        window.is_visible = lambda: True
+        app = RecordingApplication(window)
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "Fakturama.exe"
+            executable.touch()
+            gateway = WindowsFakturamaGateway(
+                app_factory=lambda **kwargs: app,
+                desktop_factory=lambda **kwargs: FakeDesktop([window]),
+                process_checker=lambda path: False,
+            )
+
+            gateway.attach_or_launch(executable)
+
+        self.assertEqual(app.connect_calls, [{"handle": 1234, "timeout": 15.0}])
+        self.assertEqual(app.start_calls, [])
+        self.assertIs(gateway._main_window, window)
+        self.assertEqual(gateway._configured_executable, executable.resolve())
+
+    def test_diagnose_only_reads_a_visible_window_and_never_starts_or_clicks(self):
+        window = FakeWindow(
+            [FakeElement("File", "MenuItem"), FakeElement("Data", "MenuItem")]
+        )
+        window.handle = 1234
+        window.process_id = 44
+        window.is_visible = lambda: True
+        window.process_path = r"C:\Program Files\Fakturama2\jre\bin\javaw.exe"
+        app = RecordingApplication(window)
+        gateway = WindowsFakturamaGateway(
+            app_factory=lambda **kwargs: app,
+            desktop_factory=lambda **kwargs: FakeDesktop([window]),
+            version_reader=lambda path: "2.2.0" if path.name == "javaw.exe" else None,
+        )
+
+        checks = gateway.diagnose()
+
+        self.assertIn("PID 44", checks["Window"])
+        self.assertEqual(checks["Version"], "2.2.0")
+        self.assertTrue(checks["Language"].startswith("English"))
+        self.assertEqual(app.connect_calls, [{"handle": 1234, "timeout": 15.0}])
+        self.assertEqual(app.start_calls, [])
+        self.assertEqual([element.click_count for element in window.descendants()], [0, 0])
+
+    def test_ambiguous_visible_windows_fail_closed_without_connecting_or_launching(self):
+        windows = [FakeWindow(), FakeWindow()]
+        for index, window in enumerate(windows, start=1):
+            window.handle = index
+            window.is_visible = lambda: True
+        app = RecordingApplication(windows[0])
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "Fakturama.exe"
+            executable.touch()
+            gateway = WindowsFakturamaGateway(
+                app_factory=lambda **kwargs: app,
+                desktop_factory=lambda **kwargs: FakeDesktop(windows),
+            )
+
+            with self.assertRaisesRegex(ManualReviewRequired, "multiple visible Fakturama"):
+                gateway.attach_or_launch(executable)
+
+        self.assertEqual(app.connect_calls, [])
+        self.assertEqual(app.start_calls, [])
+
+    def test_failed_attach_to_detected_window_never_starts_another_instance(self):
+        window = FakeWindow()
+        window.handle = 1234
+        window.is_visible = lambda: True
+        app = RecordingApplication(window, connect_error=PermissionError("access denied"))
+        gateway = WindowsFakturamaGateway(
+            app_factory=lambda **kwargs: app,
+            desktop_factory=lambda **kwargs: FakeDesktop([window]),
+            process_checker=lambda path: False,
+        )
+
+        with self.assertRaisesRegex(Exception, "a second instance was not started"):
+            gateway.attach_or_launch()
+
+        self.assertEqual(app.start_calls, [])
+
+    def test_path_connect_failure_does_not_launch_if_process_presence_is_unknown(self):
+        app = RecordingApplication(None, connect_error=PermissionError("access denied"))
+        gateway = WindowsFakturamaGateway(
+            app_factory=lambda **kwargs: app,
+            desktop_factory=lambda **kwargs: FakeDesktop([]),
+            process_checker=lambda path: None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "Fakturama.exe"
+            executable.touch()
+
+            with self.assertRaisesRegex(Exception, "could not confirm that Fakturama is stopped"):
+                gateway.attach_or_launch(executable)
+
+        self.assertEqual(app.start_calls, [])
+
+    def test_path_connect_failure_does_not_launch_if_matching_process_is_detected(self):
+        app = RecordingApplication(None, connect_error=PermissionError("access denied"))
+        gateway = WindowsFakturamaGateway(
+            app_factory=lambda **kwargs: app,
+            desktop_factory=lambda **kwargs: FakeDesktop([]),
+            process_checker=lambda path: True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "Fakturama.exe"
+            executable.touch()
+
+            with self.assertRaisesRegex(Exception, "matching Fakturama process is running"):
+                gateway.attach_or_launch(executable)
+
+        self.assertEqual(app.start_calls, [])
+
+    def test_path_connect_failure_can_launch_only_after_a_negative_process_check(self):
+        app = RecordingApplication(None, connect_error=RuntimeError("no matching process"))
+        gateway = WindowsFakturamaGateway(
+            app_factory=lambda **kwargs: app,
+            desktop_factory=lambda **kwargs: FakeDesktop([]),
+            process_checker=lambda path: False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "Fakturama.exe"
+            executable.touch()
+
+            gateway.attach_or_launch(executable)
+
+        self.assertEqual(app.start_calls, [(str(executable.resolve()), {"timeout": 15.0})])
 
     def test_order_header_maps_source_reference_date_and_modes(self):
         source = sample_order()

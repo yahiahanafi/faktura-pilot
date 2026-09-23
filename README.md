@@ -23,7 +23,7 @@ The workflow orchestrator keeps the New Order open while it resolves the Debtor 
 - Python 3.12.
 - Fakturama 2.2.0 configured in English. Use a disposable Fakturama workspace while developing: the flow can create Debtors, payment terms, VAT rates, Products, Orders, and Invoices.
 - An OpenAI API key for image extraction. The image is sent to the OpenAI API; the request uses `store=False`.
-- For OCR fallback, install the Tesseract executable separately and make `tesseract.exe` available on `PATH`.
+- OCR is optional for the UIA workflow. For OCR fallback, install the Tesseract executable separately and make `tesseract.exe` available on `PATH`.
 
 ## Install
 
@@ -52,7 +52,7 @@ The checked-in [sample config](examples/config.toml) contains non-secret default
 
 ## CLI
 
-After installation, run `image-to-cash --help` (or `python -m faktura_pilot --help`). The CLI supports `extract`, `validate`, `run`, `resume`, and `inspect`:
+After installation, run `image-to-cash --help` (or `python -m faktura_pilot --help`). The CLI supports `extract`, `validate`, `run`, `resume`, `inspect`, and the read-only `doctor` command:
 
 ```powershell
 # Extract an image and write the validated canonical order JSON.
@@ -91,11 +91,17 @@ image-to-cash run `
 # Inspect a run without opening or changing Fakturama.
 image-to-cash inspect --run-id sample-order --run-dir run-data
 
+# Diagnose the installed automation dependencies and currently open Fakturama window.
+# This only reads the window and installation metadata; it does not launch or operate Fakturama.
+image-to-cash doctor --fakturama-exe "C:\Program Files\Fakturama2\Fakturama.exe"
+
 # Resume only after resolving the review item shown by inspect/review.json.
 image-to-cash resume --run-id sample-order --run-dir run-data
 ```
 
 `extract --image` writes the validated canonical JSON. `validate --source-json` checks a canonical JSON file without an API request; `validate --image` extracts and validates but does not create Fakturama records. The fixture extractor ignores the required `--image` argument and returns the fixture, which makes extraction tests offline. For `run`, however, the Windows UIA gateway is still real and can create records. Omit `--fixture-json` to use OpenAI extraction. `resume` reads the original validated source and pending action from the saved checkpoint; it does not call the extractor again. `inspect` is read-only. `run` and `resume` return exit code 3 when the workflow pauses for manual review.
+
+`doctor` is read-only: it reports Python automation/OCR dependencies, the visible Fakturama window, its version and language, and the current process's DPI awareness. Missing Tesseract is a warning; UIA-based actions remain available, while actions that need OCR stop with an explicit error. When connecting, the gateway checks visible Fakturama windows first and attaches to a single match by window handle. Multiple matches or an inaccessible existing instance fail closed. It only starts the configured executable after a fresh window scan and a process inventory confirm no matching Fakturama process is running.
 
 `run` accepts `--run-dir` (alias `--runs-dir`, default `run-data`), optional `--run-id`, `--evidence-dir`, `--config`, `--fixture-json`, and `--fakturama-exe`. `resume` accepts the run directory, optional evidence directory, and optional executable path. The per-run folder stores the checkpoint, event log, review bundle when paused, and evidence images when captured. Keep run data private: it includes extracted customer and order data.
 

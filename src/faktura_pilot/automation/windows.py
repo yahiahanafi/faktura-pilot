@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import json
 import re
+import subprocess
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
@@ -129,6 +131,8 @@ class WindowsFakturamaGateway:
         evidence_directory: Path | None = None,
         app_factory: Callable[..., Any] | None = None,
         desktop_factory: Callable[..., Any] | None = None,
+        process_checker: Callable[[Path], bool | None] | None = None,
+        version_reader: Callable[[Path], str | None] | None = None,
     ) -> None:
         if timeout_seconds <= 0 or poll_interval_seconds <= 0:
             raise ValueError("wait timeouts must be positive")
@@ -138,8 +142,11 @@ class WindowsFakturamaGateway:
         self.evidence_directory = evidence_directory
         self._app_factory = app_factory
         self._desktop_factory = desktop_factory
+        self._process_checker = process_checker
+        self._version_reader = version_reader
         self._application: Any | None = None
         self._main_window: Any | None = None
+        self._configured_executable: Path | None = None
         self._order_ref: OrderEditorRef | None = None
         self._invoice_ref: InvoiceEditorRef | None = None
         self._last_source: OrderSource | None = None
@@ -149,37 +156,61 @@ class WindowsFakturamaGateway:
         self._dpi_aware = False
 
     def attach_or_launch(self, executable: Path | None = None) -> None:
-        if self._app_factory is None:
-            try:
-                from pywinauto import Application
-            except ImportError as exc:
-                raise GatewayError(
-                    "Windows Fakturama automation requires pywinauto; install the automation extra"
-                ) from exc
-            app_factory = Application
-        else:
-            app_factory = self._app_factory
-
+        app_factory, desktop_factory = self._automation_factories()
         self._dpi_aware = self._set_process_dpi_awareness()
         application = app_factory(backend="uia")
+        self._configured_executable = (
+            executable.expanduser().resolve() if executable is not None else None
+        )
+
+        # Prefer the already-running, visible application. Connecting by path can fail for an
+        # elevated Fakturama process even though its window is visible to UI Automation.
+        windows = self._visible_fakturama_windows(desktop_factory)
+        if len(windows) > 1:
+            raise ManualReviewRequired(self._ambiguous_windows_message(windows))
+        if windows:
+            self._attach_to_window(application, windows[0])
+            return
+
         if executable is not None:
-            executable = executable.expanduser().resolve()
+            executable = self._configured_executable
             if not executable.is_file():
                 raise GatewayError(f"configured Fakturama executable does not exist: {executable}")
             try:
                 application.connect(path=str(executable), timeout=self.timeout_seconds)
-            except Exception:
+            except Exception as connect_error:
+                # A path connection failure is ambiguous: the process may be elevated or its
+                # window may have appeared between discovery and connection. Recheck windows,
+                # then inspect processes before deciding that starting another instance is safe.
+                windows = self._visible_fakturama_windows(desktop_factory)
+                if len(windows) > 1:
+                    raise ManualReviewRequired(
+                        self._ambiguous_windows_message(windows)
+                    ) from connect_error
+                if windows:
+                    self._attach_to_window(application, windows[0])
+                    return
+                process_running = self._process_exists_for_executable(executable)
+                if process_running is not False:
+                    reason = (
+                        "a matching Fakturama process is running"
+                        if process_running
+                        else "could not confirm that Fakturama is stopped"
+                    )
+                    raise GatewayError(
+                        f"could not attach to Fakturama at {executable}: {connect_error}; "
+                        f"{reason}, so a second instance was not started"
+                    ) from connect_error
+                # A negative, successful process inventory plus a second empty window scan
+                # distinguishes a stopped app from an inaccessible running instance.
                 try:
                     application.start(str(executable), timeout=self.timeout_seconds)
                 except Exception as exc:
-                    raise GatewayError(f"could not attach to or launch Fakturama: {exc}") from exc
+                    raise GatewayError(f"could not launch Fakturama: {exc}") from exc
         else:
-            try:
-                application.connect(title_re=r"(?i).*fakturama.*", timeout=self.timeout_seconds)
-            except Exception as exc:
-                raise GatewayError(
-                    "Fakturama is not running; provide its executable path to launch it"
-                ) from exc
+            raise GatewayError(
+                "no visible Fakturama window was found; start Fakturama or provide its executable"
+            )
 
         self._application = application
         try:
@@ -190,6 +221,284 @@ class WindowsFakturamaGateway:
             ) from exc
         if self._main_window is None:
             raise GatewayError("connected to Fakturama but no top-level window was found")
+
+    def diagnose(self, executable: Path | None = None) -> dict[str, str]:
+        """Collect read-only diagnostics without launching or interacting with Fakturama."""
+        if executable is not None:
+            self._configured_executable = executable.expanduser().resolve()
+
+        checks: dict[str, str] = {}
+        configured = self._configured_executable
+        if configured is None:
+            checks["Executable"] = "not specified; using the running process path if available"
+        else:
+            checks["Executable"] = (
+                f"{configured} ({'found' if configured.is_file() else 'not found'})"
+            )
+
+        try:
+            app_factory, desktop_factory = self._automation_factories()
+        except GatewayError as exc:
+            checks["UI Automation"] = f"unavailable: {exc}"
+            checks["Window"] = "not inspected"
+            checks["Version"] = self._executable_version() or "unknown (no attached window)"
+            checks["Language"] = "unknown (no attached window)"
+            checks["DPI awareness"] = self._dpi_diagnostic()
+            return checks
+
+        checks["UI Automation"] = "pywinauto available"
+        try:
+            windows = self._visible_fakturama_windows(desktop_factory)
+        except GatewayError as exc:
+            checks["Window"] = f"could not inspect: {exc}"
+            checks["Version"] = self._executable_version() or "unknown (window discovery failed)"
+            checks["Language"] = "unknown (window discovery failed)"
+            checks["DPI awareness"] = self._dpi_diagnostic()
+            return checks
+
+        if len(windows) > 1:
+            checks["Window"] = self._ambiguous_windows_message(windows)
+            checks["Version"] = self._executable_version() or "not checked (ambiguous windows)"
+            checks["Language"] = "not checked (ambiguous windows)"
+            checks["DPI awareness"] = self._dpi_diagnostic()
+            return checks
+        if not windows:
+            checks["Window"] = "no visible Fakturama window found"
+            checks["Version"] = self._executable_version() or "unknown (no attached window)"
+            checks["Language"] = "unknown (no attached window)"
+            checks["DPI awareness"] = self._dpi_diagnostic()
+            return checks
+
+        window = windows[0]
+        try:
+            self._attach_to_window(app_factory(backend="uia"), window)
+        except GatewayError as exc:
+            checks["Window"] = f"found but could not attach: {exc}"
+            checks["Version"] = "unknown (window attachment failed)"
+            checks["Language"] = "unknown (window attachment failed)"
+            checks["DPI awareness"] = self._dpi_diagnostic()
+            return checks
+
+        title = self._window_title(window) or "(untitled)"
+        handle = _safe(window, "handle")
+        process_id = int(_safe(window, "process_id", 0) or 0)
+        process_path = _safe(window, "process_path")
+        identity = f"{title!r}, PID {process_id}"
+        if handle:
+            identity += f", HWND {handle}"
+        checks["Window"] = identity
+        if process_path:
+            checks["Process image"] = str(process_path)
+
+        version = self._executable_version()
+        checks["Version"] = version or "could not determine from the running installation"
+        root_text = _all_text(window).casefold()
+        checks["Language"] = (
+            "English (visible File and Data labels found)"
+            if all(token in root_text for token in ("file", "data"))
+            else "could not confirm English from visible menu labels"
+        )
+        checks["DPI awareness"] = self._dpi_diagnostic()
+        return checks
+
+    def _automation_factories(self) -> tuple[Callable[..., Any], Callable[..., Any]]:
+        app_factory = self._app_factory
+        desktop_factory = self._desktop_factory
+        if app_factory is None or desktop_factory is None:
+            try:
+                from pywinauto import Application, Desktop
+            except Exception as exc:
+                raise GatewayError(
+                    "Windows Fakturama automation could not load pywinauto; "
+                    "check the automation installation: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            app_factory = app_factory or Application
+            desktop_factory = desktop_factory or Desktop
+        return app_factory, desktop_factory
+
+    def _visible_fakturama_windows(self, desktop_factory: Callable[..., Any]) -> list[Any]:
+        try:
+            windows = desktop_factory(backend="uia").windows()
+        except Exception as exc:
+            raise GatewayError(f"could not inspect desktop windows: {exc}") from exc
+
+        matches: list[Any] = []
+        seen_handles: set[Any] = set()
+        for window in windows:
+            title = self._window_title(window)
+            if "fakturama" not in title.casefold() or not _safe(window, "is_visible", True):
+                continue
+            handle = _safe(window, "handle")
+            if handle is not None and handle in seen_handles:
+                continue
+            if handle is not None:
+                seen_handles.add(handle)
+            matches.append(window)
+        return matches
+
+    def _attach_to_window(self, application: Any, window: Any) -> None:
+        handle = _safe(window, "handle")
+        try:
+            if handle is not None:
+                application.connect(handle=handle, timeout=self.timeout_seconds)
+            else:
+                application.connect(
+                    title_re=r"(?i).*fakturama.*", timeout=self.timeout_seconds
+                )
+        except Exception as exc:
+            title = self._window_title(window)
+            raise GatewayError(
+                f"found existing Fakturama window {title!r} but could not attach: {exc}; "
+                "a second instance was not started"
+            ) from exc
+        self._application = application
+        self._main_window = window
+
+    @staticmethod
+    def _ambiguous_windows_message(windows: Sequence[Any]) -> str:
+        titles = [WindowsFakturamaGateway._window_title(window) for window in windows]
+        return f"multiple visible Fakturama windows found; select one manually: {titles!r}"
+
+    def _process_exists_for_executable(self, executable: Path) -> bool | None:
+        if self._process_checker is not None:
+            try:
+                return self._process_checker(executable)
+            except Exception:
+                return None
+        return self._default_process_exists_for_executable(executable)
+
+    @staticmethod
+    def _default_process_exists_for_executable(executable: Path) -> bool | None:
+        """Return None when the process inventory cannot prove the app is stopped."""
+        target = executable.resolve()
+        install_root = target.parent
+
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+
+        if psutil is not None:
+            uncertain = False
+            try:
+                # Read names first, then inspect only likely Fakturama runtimes. Asking
+                # psutil for exe and command line on every process makes an unrelated
+                # protected process turn the whole inventory into an unknown result.
+                for process in psutil.process_iter(["name"]):
+                    try:
+                        name = str(process.info.get("name") or "").casefold()
+                    except psutil.AccessDenied:
+                        uncertain = True
+                        continue
+
+                    if name in {target.name.casefold(), "fakturama.exe"}:
+                        return True
+                    if name not in {"java.exe", "javaw.exe", "eclipse.exe", "eclipsec.exe"}:
+                        continue
+
+                    try:
+                        process_path = process.exe()
+                        command_line = process.cmdline()
+                    except psutil.NoSuchProcess:
+                        continue
+                    except psutil.AccessDenied:
+                        uncertain = True
+                        continue
+
+                    if process_path:
+                        try:
+                            resolved_process = Path(process_path).resolve()
+                            if resolved_process == target:
+                                return True
+                            if resolved_process.is_relative_to(install_root):
+                                return True
+                        except (OSError, ValueError):
+                            uncertain = True
+                    normalized_args = [str(argument).casefold() for argument in command_line]
+                    root_text = str(install_root).casefold()
+                    if any(root_text in argument for argument in normalized_args):
+                        return True
+                    if any("com.sebulli.fakturama" in arg for arg in normalized_args):
+                        return True
+            except Exception:
+                return None
+            return None if uncertain else False
+
+        try:
+            import win32api
+            import win32con
+            import win32process
+
+            uncertain = False
+
+            # EnumProcesses returns only PIDs. Use tasklist to identify candidate images
+            # before opening process handles, so unrelated protected services do not make
+            # an otherwise complete Fakturama check uncertain.
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="mbcs",
+                errors="replace",
+            )
+            candidates: list[int] = []
+            inventory_read = False
+            for row in csv.reader(result.stdout.splitlines()):
+                if len(row) < 2:
+                    continue
+                inventory_read = True
+                name = row[0].strip().casefold()
+                try:
+                    process_id = int(row[1].replace(",", "").strip())
+                except ValueError:
+                    continue
+                if name in {target.name.casefold(), "fakturama.exe"}:
+                    return True
+                if name in {"java.exe", "javaw.exe", "eclipse.exe", "eclipsec.exe"}:
+                    candidates.append(process_id)
+
+            if not inventory_read:
+                return None
+
+            for process_id in candidates:
+                try:
+                    handle = win32api.OpenProcess(
+                        win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, process_id
+                    )
+                    try:
+                        process_path = Path(
+                            win32process.QueryFullProcessImageName(handle, 0)
+                        ).resolve()
+                    finally:
+                        win32api.CloseHandle(handle)
+                except Exception:
+                    uncertain = True
+                    continue
+                if process_path == target or process_path.is_relative_to(install_root):
+                    return True
+            return None if uncertain else False
+        except Exception:
+            return None
+
+    @staticmethod
+    def _dpi_diagnostic() -> str:
+        aware = WindowsFakturamaGateway._current_process_dpi_awareness()
+        if aware is None:
+            return "could not determine"
+        return "process is DPI aware" if aware else "process is not DPI aware"
+
+    @staticmethod
+    def _current_process_dpi_awareness() -> bool | None:
+        try:
+            import ctypes
+
+            if hasattr(ctypes, "windll"):
+                return bool(ctypes.windll.user32.IsProcessDPIAware())
+        except Exception:
+            pass
+        return None
 
     def preflight(
         self,
@@ -2240,70 +2549,133 @@ class WindowsFakturamaGateway:
         return len(interpretations) == 1 and expected in interpretations
 
     def _executable_version(self) -> str | None:
-        if self._main_window is None:
-            return None
-        path = _safe(self._main_window, "process_path")
-        if not path:
-            try:
-                process_id = int(_safe(self._main_window, "process_id", 0))
-                if process_id:
-                    try:
-                        from win32api import OpenProcess
-                        from win32con import PROCESS_QUERY_LIMITED_INFORMATION
-                        from win32process import QueryFullProcessImageName
-
-                        handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, process_id)
-                        path = QueryFullProcessImageName(handle, 0)
-                    except Exception:
-                        try:
-                            import psutil
-
-                            path = psutil.Process(process_id).exe()
-                        except Exception:
-                            path = None
-            except Exception:
-                path = None
-        try:
-            if path:
-                import win32api
-
-                info = win32api.GetFileVersionInfo(str(path), "\\")
-                ms = info["FileVersionMS"]
-                ls = info["FileVersionLS"]
-                return (
-                    f"{win32api.HIWORD(ms)}.{win32api.LOWORD(ms)}."
-                    f"{win32api.HIWORD(ls)}.{win32api.LOWORD(ls)}"
+        paths: list[Path] = []
+        if self._main_window is not None:
+            process_path = _safe(self._main_window, "process_path")
+            if process_path:
+                paths.append(Path(str(process_path)))
+            else:
+                process_path = self._process_image_path(
+                    int(_safe(self._main_window, "process_id", 0) or 0)
                 )
-        except Exception:
-            pass
-        if not path:
-            return None
-        try:
-            install_root = Path(str(path)).resolve().parent
+                if process_path:
+                    paths.append(Path(process_path))
+        if self._configured_executable is not None:
+            paths.append(self._configured_executable)
+
+        unique_paths: list[Path] = []
+        seen_paths: set[str] = set()
+        for path in paths:
+            try:
+                resolved = path.expanduser().resolve()
+            except OSError:
+                resolved = path.expanduser()
+            key = str(resolved).casefold()
+            if key not in seen_paths:
+                seen_paths.add(key)
+                unique_paths.append(resolved)
+
+        for path in unique_paths:
+            if self._version_reader is not None:
+                try:
+                    version = self._version_reader(path)
+                    if version:
+                        return str(version)
+                except Exception:
+                    pass
+            version = self._windows_file_version(path)
+            if version:
+                return version
+
+        # The visible UIA process may be the bundled javaw.exe rather than Fakturama.exe.
+        # Walk a few ancestors from both the process image and configured launcher to find
+        # the Eclipse installation's bundles.info metadata.
+        roots: list[Path] = []
+        for path in unique_paths:
+            roots.extend(list(path.parents)[:7])
+        unique_roots: list[Path] = []
+        seen_roots: set[str] = set()
+        for root in roots:
+            key = str(root).casefold()
+            if key not in seen_roots:
+                seen_roots.add(key)
+                unique_roots.append(root)
+
+        for install_root in unique_roots:
             bundles_info = (
                 install_root
                 / "configuration"
                 / "org.eclipse.equinox.simpleconfigurator"
                 / "bundles.info"
             )
-            if bundles_info.is_file():
-                for line in bundles_info.read_text(encoding="utf-8", errors="replace").splitlines():
-                    parts = line.split(",")
-                    if len(parts) > 1 and parts[0] == "com.sebulli.fakturama.rcp":
-                        return parts[1]
-            plugin_directories = (install_root / "plugins", install_root.parent / "plugins")
-            for plugins in plugin_directories:
-                candidates = list(plugins.glob("com.sebulli.fakturama.rcp_*.jar"))
-                if candidates:
-                    match = re.search(
-                        r"com\.sebulli\.fakturama\.rcp_(\d+(?:\.\d+)+)",
-                        candidates[0].name,
-                    )
-                    if match:
-                        return match.group(1)
-        except OSError:
-            pass
+            try:
+                if bundles_info.is_file():
+                    for line in bundles_info.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines():
+                        parts = line.split(",")
+                        if len(parts) > 1 and parts[0] == "com.sebulli.fakturama.rcp":
+                            return parts[1]
+            except OSError:
+                continue
+
+            plugins = install_root / "plugins"
+            try:
+                if plugins.is_dir():
+                    candidates = sorted(plugins.glob("com.sebulli.fakturama.rcp_*.jar"))
+                    if candidates:
+                        match = re.search(
+                            r"com\.sebulli\.fakturama\.rcp_(\d+(?:\.\d+)+)",
+                            candidates[0].name,
+                        )
+                        if match:
+                            return match.group(1)
+            except OSError:
+                continue
         return None
+
+    @staticmethod
+    def _process_image_path(process_id: int) -> str | None:
+        if not process_id:
+            return None
+        try:
+            import win32api
+            import win32con
+            import win32process
+
+            handle = win32api.OpenProcess(
+                win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, process_id
+            )
+            try:
+                return win32process.QueryFullProcessImageName(handle, 0)
+            finally:
+                win32api.CloseHandle(handle)
+        except Exception:
+            try:
+                import psutil
+
+                return psutil.Process(process_id).exe()
+            except Exception:
+                return None
+
+    @staticmethod
+    def _windows_file_version(path: Path) -> str | None:
+        # javaw.exe's file version describes Java, not Fakturama. Only trust an executable
+        # resource when the image identifies itself as Fakturama.
+        if "fakturama" not in path.name.casefold():
+            return None
+        try:
+            import win32api
+
+            info = win32api.GetFileVersionInfo(str(path), "\\")
+            ms = info["FileVersionMS"]
+            ls = info["FileVersionLS"]
+            return (
+                f"{win32api.HIWORD(ms)}.{win32api.LOWORD(ms)}."
+                f"{win32api.HIWORD(ls)}.{win32api.LOWORD(ls)}"
+            )
+        except Exception:
+            return None
 
     @staticmethod
     def _set_process_dpi_awareness() -> bool:

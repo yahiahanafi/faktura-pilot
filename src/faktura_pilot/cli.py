@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.metadata
 import json
+import shutil
 import sys
 import uuid
 from collections.abc import Sequence
@@ -80,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("run-data"),
         help="base directory for checkpoint and evidence subdirectories",
     )
+
+    doctor = commands.add_parser(
+        "doctor", help="read-only diagnostics for the Fakturama desktop setup"
+    )
+    doctor.add_argument("--fakturama-exe", type=Path)
     return parser
 
 
@@ -150,10 +158,71 @@ def _print_checkpoint(checkpoint: WorkflowCheckpoint, runs_dir: Path) -> None:
         print(f"Review bundle: {runs_dir / checkpoint.run_id / 'review.json'}")
 
 
+def _doctor_dependency(module: str, distribution: str | None = None) -> str:
+    try:
+        imported = importlib.import_module(module)
+    except ImportError:
+        return "not installed"
+    except Exception as exc:
+        return f"unavailable ({type(exc).__name__}: {exc})"
+    if distribution is not None:
+        try:
+            return importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    return str(getattr(imported, "__version__", "installed"))
+
+
+def _doctor(executable: Path | None) -> int:
+    from faktura_pilot.automation.windows import WindowsFakturamaGateway
+
+    print("Fakturama doctor (read-only)")
+    pywinauto = _doctor_dependency("pywinauto")
+    pytesseract = _doctor_dependency("pytesseract")
+    opencv = _doctor_dependency("cv2", "opencv-python-headless")
+    tesseract = shutil.which("tesseract")
+    print(f"pywinauto: {pywinauto}")
+    print(f"pytesseract: {pytesseract}")
+    print(f"OpenCV: {opencv}")
+    if pytesseract == "not installed":
+        print("OCR: WARNING - pytesseract is missing; OCR fallback is unavailable")
+    elif not tesseract:
+        print("OCR: WARNING - Tesseract executable is missing; OCR fallback is unavailable")
+    else:
+        print(f"Tesseract: {tesseract}")
+
+    checks = WindowsFakturamaGateway().diagnose(executable)
+    for name, detail in checks.items():
+        print(f"{name}: {detail}")
+
+    window = checks.get("Window", "")
+    version = checks.get("Version", "")
+    language = checks.get("Language", "")
+    ui_automation_ready = (
+        pywinauto != "not installed"
+        and "multiple visible" not in window.casefold()
+        and "could not attach" not in window.casefold()
+        and "PID " in window
+        and version.startswith("2.2.0")
+        and language.startswith("English")
+    )
+    if not ui_automation_ready:
+        print("Result: Fakturama is not ready for the configured UIA workflow")
+        return 1
+    if not tesseract:
+        print("Result: UI Automation is ready; actions requiring OCR will stop safely")
+    else:
+        print("Result: UI Automation is ready")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "doctor":
+            return _doctor(args.fakturama_exe)
+
         if args.command == "run":
             run_id = args.run_id or uuid.uuid4().hex
             store = WorkflowStore(args.runs_dir)
