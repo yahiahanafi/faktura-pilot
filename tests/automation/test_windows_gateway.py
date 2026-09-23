@@ -320,7 +320,7 @@ class WindowsGatewayTests(unittest.TestCase):
         window.handle = 1234
         window.process_id = 44
         window.is_visible = lambda: True
-        window.process_path = r"C:\Program Files\Fakturama2\jre\bin\javaw.exe"
+        window.process_path = str(Path("Fakturama2") / "jre" / "bin" / "javaw.exe")
         app = RecordingApplication(window)
         gateway = WindowsFakturamaGateway(
             app_factory=lambda **kwargs: app,
