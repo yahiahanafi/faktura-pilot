@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+from decimal import Decimal
+from pathlib import Path
+from typing import Protocol, runtime_checkable
+
+from faktura_pilot.automation.models import (
+    DebtorCandidate,
+    DocumentRow,
+    InvoiceEditorRef,
+    OrderEditorRef,
+    PaymentMethodCandidate,
+    PreflightResult,
+    ProductCandidate,
+    VatCandidate,
+    VerificationResult,
+)
+from faktura_pilot.domain.models import Debtor, Item, OrderSource
+
+
+@runtime_checkable
+class FakturamaGateway(Protocol):
+    """Staged, semantic interface to Fakturama's Order-first UI workflow.
+
+    Candidate tokens and editor references are session-local hints. Callers must
+    persist business identifiers, not these tokens, and must rediscover candidates
+    after a process restart or selector refresh.
+    """
+
+    def attach_or_launch(self, executable: Path | None = None) -> None: ...
+
+    def preflight(
+        self,
+        expected_version: str = "2.2.0",
+        expected_language: str = "English",
+    ) -> PreflightResult: ...
+
+    def open_new_order(self) -> OrderEditorRef: ...
+
+    def discover_open_order(self, source: OrderSource) -> OrderEditorRef | None: ...
+
+    def discover_open_invoice(
+        self,
+        source: OrderSource,
+        order_number: str,
+    ) -> InvoiceEditorRef | None: ...
+
+    def order_is_open(self, ref: OrderEditorRef) -> bool: ...
+
+    def fill_order_header(self, source: OrderSource) -> None: ...
+
+    def open_debtor_selector(self) -> None: ...
+
+    def find_debtors(self, query: str) -> list[DebtorCandidate]: ...
+
+    def select_debtor(self, candidate: DebtorCandidate) -> None: ...
+
+    def open_new_debtor(self) -> None: ...
+
+    def fill_debtor(self, debtor: Debtor) -> None: ...
+
+    def find_payment_methods(self, query: str) -> list[PaymentMethodCandidate]: ...
+
+    def create_payment_method(self, name: str, code: str) -> PaymentMethodCandidate: ...
+
+    def select_payment_method(self, candidate: PaymentMethodCandidate) -> None: ...
+
+    def save_debtor(self) -> DebtorCandidate: ...
+
+    def return_to_order(self, ref: OrderEditorRef) -> None: ...
+
+    def verify_order_debtor(self, debtor: Debtor) -> VerificationResult: ...
+
+    def find_vats(self, rate: Decimal) -> list[VatCandidate]: ...
+
+    def create_vat(self, rate: Decimal) -> VatCandidate: ...
+
+    def find_products(self, sku: str) -> list[ProductCandidate]: ...
+
+    def open_product_selector(self) -> None: ...
+
+    def select_product(self, candidate: ProductCandidate) -> None: ...
+
+    def open_new_product(self) -> None: ...
+
+    def fill_product(self, item: Item, vat: VatCandidate) -> None: ...
+
+    def save_product(self) -> ProductCandidate: ...
+
+    def fill_order_line(self, item: Item) -> VerificationResult: ...
+
+    def verify_order_line(self, item: Item, item_index: int) -> VerificationResult: ...
+
+    def verify_order_totals(self, source: OrderSource) -> VerificationResult: ...
+
+    def save_order(self) -> str: ...
+
+    def verify_order_document(self, source: OrderSource, order_number: str) -> DocumentRow: ...
+
+    def create_linked_invoice(self, order_number: str) -> InvoiceEditorRef: ...
+
+    def verify_invoice_copied_order(
+        self,
+        source: OrderSource,
+        order_number: str,
+    ) -> VerificationResult: ...
+
+    def apply_payment(self, source: OrderSource) -> VerificationResult: ...
+
+    def save_invoice(self) -> str: ...
+
+    def verify_final_documents(
+        self,
+        source: OrderSource,
+        order_number: str,
+        invoice_number: str,
+    ) -> VerificationResult: ...
+
+    def find_documents(
+        self,
+        source: OrderSource,
+        document_type: str,
+        linked_order_number: str | None = None,
+    ) -> list[DocumentRow]: ...
+
+    def capture_evidence(self, label: str) -> Path | None: ...

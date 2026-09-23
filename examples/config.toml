@@ -1,0 +1,8 @@
+[image_to_cash]
+model = "gpt-6-luna"
+reasoning_effort = "low"
+request_timeout_seconds = 90
+max_image_bytes = 20000000
+prompt_version = "1.0"
+
+# Do not put OPENAI_API_KEY here. Supply it through the process environment.
