@@ -1,0 +1,35 @@
+1. Clone the Github Repo
+
+2. Open the cmd of the Repo
+
+4. Download Dependencies
+
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[automation,ocr]"
+
+5. Add the OpenAi Key for the Data Extraction
+
+$credential = Get-Credential -UserName "OpenAI API key" -Message "Enter the key as the password"
+$env:OPENAI_API_KEY = $credential.GetNetworkCredential().Password
+Remove-Variable credential
+
+6. Open Fakturama
+
+7. Check Fakturama connection with the Automation
+
+image-to-cash doctor --fakturama-exe "C:\Program Files\Fakturama2\Fakturama.exe"
+
+8. Run the Following Command to run the system
+
+image-to-cash run `
+  --image "C:\orders\order.png" `
+  --config examples\config.toml `
+  --run-dir run-data
+
+9. You will see the Automation Running on your Screen; Any manual review you will get a pop up to and you can click yes to continue after reviewing
+
+10. After the System Finishes there is a pop up of completion
+
+11. There is in Depth reporting in the cmd that you can monitor
