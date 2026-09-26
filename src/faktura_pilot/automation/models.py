@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,8 @@ class InvoiceEditorRef:
     token: str
     number: str | None = None
     linked_order_number: str | None = None
+    proposed_invoice_date: str | None = None
+    proposed_service_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,7 @@ class DebtorCandidate:
     city: str
     billing_address: str | None = None
     delivery_address: str | None = None
+    number: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,7 @@ class DocumentRow:
     total: Decimal
     state: str
     linked_order_number: str | None = None
+    document_date: date | None = None
 
 
 @dataclass(frozen=True)

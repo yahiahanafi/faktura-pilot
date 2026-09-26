@@ -21,7 +21,7 @@ class AppConfig(BaseModel):
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
     request_timeout_seconds: float = Field(default=90.0, gt=0, le=600)
     max_image_bytes: int = Field(default=20_000_000, gt=0)
-    prompt_version: str = "1.0"
+    prompt_version: str = "2.0"
 
     @classmethod
     def load(
@@ -37,6 +37,13 @@ class AppConfig(BaseModel):
             except (OSError, tomllib.TOMLDecodeError) as exc:
                 raise ConfigurationError(f"could not read configuration file: {exc}") from exc
             if "image_to_cash" in loaded:
+                unexpected = set(loaded) - {"image_to_cash"}
+                if unexpected:
+                    names = ", ".join(sorted(unexpected))
+                    raise ConfigurationError(
+                        "configuration values must be inside the [image_to_cash] table; "
+                        f"found top-level key(s): {names}"
+                    )
                 loaded = loaded["image_to_cash"]
             if not isinstance(loaded, dict):
                 raise ConfigurationError("configuration must be a TOML table")

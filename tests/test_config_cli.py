@@ -14,6 +14,7 @@ class ConfigAndCliTests(unittest.TestCase):
         config = AppConfig.load(environ={})
         self.assertEqual(config.model, "gpt-6-luna")
         self.assertEqual(config.reasoning_effort, "low")
+        self.assertEqual(config.prompt_version, "2.0")
 
         config = AppConfig.load(
             environ={"OPENAI_API_KEY": "secret", "IMAGE_TO_CASH_REQUEST_TIMEOUT_SECONDS": "45"}
@@ -21,6 +22,9 @@ class ConfigAndCliTests(unittest.TestCase):
         self.assertEqual(config.openai_api_key.get_secret_value(), "secret")
         self.assertEqual(config.request_timeout_seconds, 45.0)
         self.assertNotIn("secret", repr(config))
+
+        max_reasoning = AppConfig.load(environ={"IMAGE_TO_CASH_REASONING_EFFORT": "max"})
+        self.assertEqual(max_reasoning.reasoning_effort, "max")
 
     def test_config_reads_toml_then_environment_wins(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -42,6 +46,17 @@ class ConfigAndCliTests(unittest.TestCase):
 
         with self.assertRaises(ConfigurationError):
             AppConfig.load(environ={"IMAGE_TO_CASH_REQUEST_TIMEOUT_SECONDS": "0"})
+
+    def test_config_rejects_values_outside_the_named_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir, "misplaced.toml")
+            config_path.write_text(
+                'model = "gpt-6-luna"\n[image_to_cash]\nreasoning_effort = "low"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigurationError, "top-level key.*model"):
+                AppConfig.load(config_path, environ={})
 
     def test_validate_cli_accepts_canonical_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

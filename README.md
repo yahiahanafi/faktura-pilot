@@ -17,13 +17,15 @@ The extraction adapter returns the canonical `OrderSource` model. Business branc
 
 The workflow orchestrator keeps the New Order open while it resolves the Debtor and Products. It selects an existing record only when the configured identity fields match exactly, creates a record only when no exact result exists, and stops for manual review when results are ambiguous or a verification check fails. Saved records are re-read from Fakturama before the next document action. Real desktop execution requires the Windows gateway to be available and connected to a disposable Fakturama workspace.
 
+The Order-first flow opens the New Order editor from **Order**, leaves its proposed **No.** unchanged, and sets the extracted **Date** and **Cust.Ref.**. It uses **Net** price mode with **VAT** set to **With VAT**. The Order's Debtor and Product selectors are used for exact-match lookups first. The Order stays open while any missing Debtor, payment method, VAT rate, or Product is created through the corresponding Fakturama data view, then the new record is selected from the same Order.
+
 ## Prerequisites
 
 - Windows 10 or 11 with an interactive desktop session. Fakturama UI automation cannot run in a headless GitHub Actions worker.
 - Python 3.12.
 - Fakturama 2.2.0 configured in English. Use a disposable Fakturama workspace while developing: the flow can create Debtors, payment terms, VAT rates, Products, Orders, and Invoices.
 - An OpenAI API key for image extraction. The image is sent to the OpenAI API; the request uses `store=False`.
-- OCR is optional for the UIA workflow. For OCR fallback, install the Tesseract executable separately and make `tesseract.exe` available on `PATH`.
+- OCR is optional for the UIA workflow. For OCR fallback, install Tesseract separately. The gateway checks `PATH`, the `FAKTURA_PILOT_TESSERACT_EXE` override, and common Windows installation locations.
 
 ## Install
 
@@ -101,9 +103,31 @@ image-to-cash resume --run-id sample-order --run-dir run-data
 
 `extract --image` writes the validated canonical JSON. `validate --source-json` checks a canonical JSON file without an API request; `validate --image` extracts and validates but does not create Fakturama records. The fixture extractor ignores the required `--image` argument and returns the fixture, which makes extraction tests offline. For `run`, however, the Windows UIA gateway is still real and can create records. Omit `--fixture-json` to use OpenAI extraction. `resume` reads the original validated source and pending action from the saved checkpoint; it does not call the extractor again. `inspect` is read-only. `run` and `resume` return exit code 3 when the workflow pauses for manual review.
 
-`doctor` is read-only: it reports Python automation/OCR dependencies, the visible Fakturama window, its version and language, and the current process's DPI awareness. Missing Tesseract is a warning; UIA-based actions remain available, while actions that need OCR stop with an explicit error. When connecting, the gateway checks visible Fakturama windows first and attaches to a single match by window handle. Multiple matches or an inaccessible existing instance fail closed. It only starts the configured executable after a fresh window scan and a process inventory confirm no matching Fakturama process is running.
+`doctor` is read-only: it reports Python automation/OCR dependencies, executable discovery, the visible Fakturama window, its version and language, and the current process's DPI awareness. Missing or unusable Tesseract is a warning; UIA-based actions can remain available, while actions that need OCR stop with an explicit error. When connecting, the gateway checks visible Fakturama windows first and attaches to a single match by window handle. If no window is visible, it searches Windows App Paths and common install locations. Set `FAKTURAMA_EXE` or pass `--fakturama-exe` to select another path; multiple discovered installations require an explicit path. The gateway starts an executable only after a fresh window scan and process inventory confirm no matching Fakturama process is running. After startup, it rescans for a visible window for up to three minutes and reports an error if the process never exposes one.
 
-`run` accepts `--run-dir` (alias `--runs-dir`, default `run-data`), optional `--run-id`, `--evidence-dir`, `--config`, `--fixture-json`, and `--fakturama-exe`. `resume` accepts the run directory, optional evidence directory, and optional executable path. The per-run folder stores the checkpoint, event log, review bundle when paused, and evidence images when captured. Keep run data private: it includes extracted customer and order data.
+`run` accepts `--run-dir` (alias `--runs-dir`, default `run-data`), optional `--run-id`, `--evidence-dir`, `--config`, `--fixture-json`, and `--fakturama-exe`. Omit `--fakturama-exe` to use automatic discovery, or set `FAKTURAMA_EXE` for an installation outside the searched locations. `resume` accepts the run directory, optional evidence directory, and optional executable path. The per-run folder stores the checkpoint, event log, review bundle when paused, and evidence images when captured. Keep run data private: it includes extracted customer and order data.
+
+## Live progress and troubleshooting
+
+`run`, `resume`, `extract`, and `validate` report their current step to the command window automatically. Each line includes local time and elapsed seconds. The report shows image extraction and independent verification, connection checks, customer/product resolution, actions awaiting confirmation, verified workflow states, and the reason for any review pause. During a blocking operation, a heartbeat reports the current step every 20 seconds without restarting or repeating that operation.
+
+When `run` or `resume` stops for manual review in an interactive Windows terminal, it plays a warning sound and opens a popup showing the run ID, reason, and path to `review.json`. The popup appears after automation stops and the review bundle is saved. Use **Open review bundle** to inspect the saved details. After resolving the issue in Fakturama, click **Yes, continue**. The workflow verifies completed work, skips those items, and continues the same run in a new console; **Close** dismisses the popup. The original command returns exit code 3 without waiting for the popup. Use `--no-review-alert` to suppress it, or `--review-alert` to enable it explicitly when running with redirected input. `--quiet` also disables the alert by default. Noninteractive runs and non-Windows systems do not alert automatically. The popup helper remains open until dismissed; closing the command window does not dismiss it. When `run` or `resume` completes the full Order and Invoice workflow, it also plays a success sound and opens a popup with the run ID and document numbers. Completion popups follow the same interactive Windows defaults; use `--no-completion-alert` to suppress one or `--completion-alert` to enable it with redirected input.
+
+Use `--progress-interval 5` for more frequent heartbeat checks or `--quiet` to suppress progress. Progress is flushed to **stderr**, keeping extracted JSON on **stdout** usable by other programs. To retain the console report in PowerShell:
+
+```powershell
+image-to-cash run --image examples\order-image.png `
+  --fixture-json examples\order-source.json --run-id progress-demo `
+  --run-dir run-data --progress-interval 5 2> run-progress.log
+```
+
+This example uses the validated fixture and still operates Fakturama. Omit `--fixture-json` to extract the image through the API. Use `resume` for an existing checkpoint; it reuses validated source data and avoids both extraction requests. The example config explicitly uses high reasoning effort, while the application default is low; preserve the verification pass when tuning extraction speed.
+
+The durable `events.jsonl` now records step starts as well as confirmed actions and verified states, so interrupted runs show the last operation reached. Review details remain in `review.json`. A heartbeat means the process is still waiting; it does not claim that a UI action succeeded.
+
+Automation work has been reduced by sharing a UIA tree snapshot within each field-resolution operation and reading selector labels and rows from one OCR pass. Product lookup previously used four OCR passes. Native window discovery also reduced connection and environment checks from 41.2 seconds to 1.0 second in the recorded live comparison; this is a startup measurement, not full-run timing. Snapshot reuse ends before the next UI action to avoid stale controls. Overlapping OCR copies of the same visible label are merged, while distinct matching controls still require review. These changes remove redundant work; end-to-end speed depends on the desktop and must be measured on a live run.
+
+The [saved-run audit](docs/run-data-audit.md) records the cause and recovery disposition for every historical run. Leave those checkpoints intact as evidence. A run with an incorrect extracted postcode needs corrected source data in a new run. A pending action with an uncertain outcome must be reconciled against the existing editor or saved document before it can continue.
 
 ## Deterministic rules and validation
 
@@ -134,17 +158,3 @@ python -m compileall -q src tests
 
 The GitHub Actions workflow installs the project and development tools, then runs `ruff check src tests` and `python -m pytest` under Python 3.12 without Fakturama, UIA, OCR, or API credentials. The tests can also be run locally with `python -m unittest discover -s tests -v`; Ruff and pytest are part of the `dev` extra. The Fakturama desktop flow must be exercised locally in a disposable workspace.
 
-## Known limitations and skipped work
-
-- Part 1, the separate design-document deliverable, is intentionally skipped.
-- The OpenAI adapter is covered with a mocked response in unit tests; a live API extraction has not been run as part of automated CI.
-- The Windows UIA/OCR gateway and end-to-end CLI are implemented, but live Fakturama UI behavior has not been smoke-tested in this environment. The gateway must still be validated against the exact Fakturama 2.2.0 installation, English UI labels, Windows scaling, and workspace data.
-- GitHub Actions cannot verify Windows UIA behavior or Fakturama document persistence. Those checks require an interactive Windows desktop and a disposable Fakturama 2.2.0 workspace.
-- OCR support depends on a separately installed Tesseract binary. OpenCV is optional; when unavailable, the OCR path uses grayscale preprocessing.
-- The assessment flow accepts EUR and the English Fakturama UI only. Other currencies, unsupported payment mappings, missing required source fields, unreadable VAT, and ambiguous master records pause for review rather than being guessed.
-- Successful-step screenshots and a short recording must be captured manually during a local end-to-end run; CI does not fabricate UI evidence. Failure/review screenshots are captured when possible.
-- The Debtor and Product forms use semantic labels discovered from UI Automation. A Fakturama build with materially different or inaccessible labels can require a manual review instead of continuing.
-
-## If I had 3 more hours
-
-I would run the full supplied-image case against a disposable Fakturama 2.2.0 workspace and validate the persisted Order/Invoice relationship, payment state, and master data. I would also exercise recovery after a forced pause, correct any UIA/OCR label mismatches found on the real installation, and capture the required annotated screenshots and short recording. Unit and fake-gateway tests cannot establish those live desktop behaviors.

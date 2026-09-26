@@ -53,7 +53,6 @@ class Address(DomainModel):
     address_specification: str | None
     district: str | None
 
-
 class Debtor(DomainModel):
     company: str = Field(min_length=1)
     first_name: str | None
@@ -157,7 +156,43 @@ class OrderTotals(DomainModel):
         return value
 
 
+class Shipping(DomainModel):
+    name: str = Field(min_length=1)
+    net_amount: Decimal
+    vat_rate_percent: Decimal
+
+    @field_validator("net_amount", mode="before")
+    @classmethod
+    def parse_net_amount(cls, value: Any) -> Decimal:
+        return _money(value)
+
+    @field_validator("vat_rate_percent", mode="before")
+    @classmethod
+    def parse_vat_rate(cls, value: Any) -> Decimal:
+        return _decimal(value)
+
+    @field_validator("net_amount")
+    @classmethod
+    def net_amount_must_not_be_negative(cls, value: Decimal) -> Decimal:
+        if value < ZERO:
+            raise ValueError("shipping net amount must not be negative")
+        return value
+
+    @field_validator("vat_rate_percent")
+    @classmethod
+    def vat_rate_must_be_in_range(cls, value: Decimal) -> Decimal:
+        if value < ZERO or value > Decimal("100"):
+            raise ValueError("shipping VAT percentage must be between 0 and 100")
+        return value
+
+
 class OriginalValue(DomainModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=False,
+        validate_assignment=True,
+    )
+
     field_path: str = Field(min_length=1)
     text: str = Field(min_length=1)
 
@@ -192,8 +227,22 @@ class OrderSource(DomainModel):
     debtor: Debtor
     payment: Payment
     items: list[Item] = Field(min_length=1)
+    order_discount_percent: Decimal = Decimal("0")
+    shipping: Shipping | None = None
     totals: OrderTotals
     extraction: ExtractionMetadata
+
+    @field_validator("order_discount_percent", mode="before")
+    @classmethod
+    def parse_order_discount(cls, value: Any) -> Decimal:
+        return _decimal(value)
+
+    @field_validator("order_discount_percent")
+    @classmethod
+    def order_discount_must_be_in_range(cls, value: Decimal) -> Decimal:
+        if value < ZERO or value > Decimal("100"):
+            raise ValueError("order discount percentage must be between 0 and 100")
+        return value
 
     @field_validator("currency")
     @classmethod
@@ -219,7 +268,9 @@ class OrderSource(DomainModel):
                     f"{item.source_line_net_total} does not match calculated {calculated}"
                 )
 
-        calculated_totals = calculate_order_totals(self.items)
+        calculated_totals = calculate_order_totals(
+            self.items, self.order_discount_percent, self.shipping
+        )
         for name in ("net", "vat", "gross"):
             source_value = getattr(self.totals, name)
             calculated_value = getattr(calculated_totals, name)

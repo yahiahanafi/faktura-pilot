@@ -28,7 +28,7 @@ class DoctorCliTests(unittest.TestCase):
                 "faktura_pilot.cli._doctor_dependency",
                 side_effect=["0.6.9", "0.3.13", "5.0.0"],
             ),
-            patch("faktura_pilot.cli.shutil.which", return_value=None),
+            patch("faktura_pilot.cli.find_tesseract_executable", return_value=None),
             redirect_stdout(output),
         ):
             status = main(["doctor"])
@@ -58,12 +58,16 @@ class DoctorCliTests(unittest.TestCase):
                 return_value=checks,
             ) as diagnose,
             patch("faktura_pilot.cli._doctor_dependency", return_value="installed"),
-            patch("faktura_pilot.cli.shutil.which", return_value="C:/Tools/tesseract.exe"),
+            patch(
+                "faktura_pilot.cli.find_tesseract_executable",
+                return_value=Path("C:/Tools/tesseract.exe"),
+            ),
             redirect_stdout(output),
         ):
             status = main(["doctor", "--fakturama-exe", str(path)])
 
         self.assertEqual(status, 0)
+        self.assertIn("Tesseract: C:\\Tools\\tesseract.exe", output.getvalue())
         diagnose.assert_called_once_with(path)
 
     def test_dependency_initialization_error_is_reported_instead_of_crashing(self):
@@ -75,6 +79,32 @@ class DoctorCliTests(unittest.TestCase):
 
         self.assertIn("RuntimeError", result)
         self.assertIn("broken native initialization", result)
+
+    def test_unavailable_pywinauto_cannot_be_reported_as_ready(self):
+        checks = {
+            "UI Automation": "pywinauto available",
+            "Window": "'Fakturama', PID 1, HWND 2",
+            "Version": "2.2.0",
+            "Language": "English (visible File and Data labels found)",
+            "DPI awareness": "process is DPI aware",
+        }
+        output = io.StringIO()
+        with (
+            patch(
+                "faktura_pilot.automation.windows.WindowsFakturamaGateway.diagnose",
+                return_value=checks,
+            ),
+            patch(
+                "faktura_pilot.cli._doctor_dependency",
+                side_effect=["unavailable (RuntimeError: broken import)", "installed", "installed"],
+            ),
+            patch("faktura_pilot.cli.find_tesseract_executable", return_value=None),
+            redirect_stdout(output),
+        ):
+            status = main(["doctor"])
+
+        self.assertEqual(status, 1)
+        self.assertIn("Fakturama is not ready", output.getvalue())
 
 
 if __name__ == "__main__":

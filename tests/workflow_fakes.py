@@ -67,6 +67,9 @@ class ScriptedGateway:
         self.preflight_calls += 1
         return PreflightResult("Fakturama", 42, "2.2.0", "English", True)
 
+    def ensure_currency(self, currency: str, *, allow_change: bool = False) -> None:
+        self.currency = currency
+
     def open_new_order(self) -> OrderEditorRef:
         self.open_order_calls += 1
         self.order_ref = OrderEditorRef("order-token", "ORD-100")
@@ -196,6 +199,13 @@ class ScriptedGateway:
 
     def verify_order_line(self, item: Item, item_index: int) -> VerificationResult:
         return self.verified(self.order_lines.get(item_index) == item)
+
+    def prepare_order_adjustments(self, source: OrderSource) -> None:
+        self.prepared_adjustment_source = source
+
+    def apply_order_adjustments(self, source: OrderSource) -> VerificationResult:
+        self.adjustment_source = source
+        return self.verified()
 
     def verify_order_totals(self, source: OrderSource) -> VerificationResult:
         return self.verified(not self.fail_order_totals)

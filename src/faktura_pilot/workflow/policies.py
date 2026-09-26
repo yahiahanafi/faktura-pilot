@@ -13,6 +13,7 @@ from faktura_pilot.domain.policy import (
     CandidateResolution,
     DebtorIdentity,
     PaymentCode,
+    ResolutionAction,
     VatIdentity,
     debtor_matches,
     normalize_text,
@@ -27,7 +28,7 @@ def resolve_debtor(
     expected: Debtor,
     candidates: list[DebtorCandidate],
 ) -> CandidateResolution[DebtorCandidate]:
-    return resolve_exact_candidates(
+    resolution = resolve_exact_candidates(
         candidates,
         lambda candidate: debtor_matches(
             expected,
@@ -40,6 +41,46 @@ def resolve_debtor(
             ),
         ),
     )
+    expected_person = (normalize_text(expected.first_name), normalize_text(expected.last_name))
+    has_expected_person = all(expected_person)
+    conflicts = [
+        candidate
+        for candidate in candidates
+        if (
+            normalize_text(candidate.company)
+            and normalize_text(candidate.company) == normalize_text(expected.company)
+        )
+        or (
+            has_expected_person
+            and (normalize_text(candidate.first_name), normalize_text(candidate.last_name))
+            == expected_person
+        )
+    ]
+    conflicting_candidates = [
+        candidate
+        for candidate in conflicts
+        if not debtor_matches(
+            expected,
+            DebtorIdentity(
+                company=candidate.company,
+                first_name=candidate.first_name,
+                last_name=candidate.last_name,
+                zip_code=candidate.zip_code,
+                city=candidate.city,
+            ),
+        )
+    ]
+    if conflicting_candidates:
+        return CandidateResolution(
+            action=ResolutionAction.MANUAL_REVIEW,
+            match=None,
+            exact_match_count=resolution.exact_match_count,
+            reason=(
+                "a result shares the debtor company or customer name but conflicts with one or "
+                "more required identity fields"
+            ),
+        )
+    return resolution
 
 
 def resolve_product(
@@ -56,6 +97,14 @@ def resolve_vat(
     rate: Decimal,
     candidates: list[VatCandidate],
 ) -> CandidateResolution[VatCandidate]:
+    conflicts = conflicting_vat(rate, candidates)
+    if conflicts:
+        return CandidateResolution(
+            action=ResolutionAction.MANUAL_REVIEW,
+            match=None,
+            exact_match_count=0,
+            reason="a VAT result shares the requested name or rate but has conflicting settings",
+        )
     return resolve_exact_candidates(
         candidates,
         lambda candidate: vat_matches(
@@ -81,6 +130,28 @@ def resolve_payment_method(
     code: PaymentCode,
     candidates: list[PaymentMethodCandidate],
 ) -> CandidateResolution[PaymentMethodCandidate]:
+    named_candidates = [
+        candidate
+        for candidate in candidates
+        if normalize_text(candidate.name) == normalize_text(source_method)
+    ]
+    conflicting_definitions = [
+        candidate
+        for candidate in named_candidates
+        if candidate.code is not None
+        and normalize_text(candidate.code) != normalize_text(code.value)
+    ]
+    if conflicting_definitions:
+        return CandidateResolution(
+            action=ResolutionAction.MANUAL_REVIEW,
+            match=None,
+            exact_match_count=0,
+            reason=(
+                "a payment method with the requested name has a conflicting payment-code "
+                "definition"
+            ),
+        )
+
     def exact(candidate: PaymentMethodCandidate) -> bool:
         if normalize_text(candidate.name) != normalize_text(source_method):
             return False

@@ -29,6 +29,31 @@ class DomainModelTests(unittest.TestCase):
         self.assertEqual(order.items[0].unit_net_price, Decimal("250.00"))
         self.assertEqual(order.totals.gross, Decimal("678.30"))
 
+    def test_postcodes_support_multiple_country_formats(self) -> None:
+        examples = (
+            ("Germany", "01017"),
+            ("Germany", "1017"),
+            ("United Kingdom", "SW1A 1AA"),
+            ("Canada", "K1A 0B1"),
+        )
+        for country, zip_code in examples:
+            order_data = sample_order().model_dump(mode="python")
+            order_data["debtor"]["billing_address"]["country"] = country
+            order_data["debtor"]["billing_address"]["zip_code"] = zip_code
+
+            with self.subTest(country=country, zip_code=zip_code):
+                order = OrderSource.model_validate(order_data)
+                self.assertEqual(order.debtor.billing_address.zip_code, zip_code)
+
+    def test_source_value_audit_preserves_exact_spacing_and_punctuation(self) -> None:
+        order_data = sample_order().model_dump(mode="python")
+        original_text = "  WEB-2026-0714-A17 / PO#  "
+        order_data["extraction"]["source_values"][0]["text"] = original_text
+
+        order = OrderSource.model_validate(order_data)
+
+        self.assertEqual(order.extraction.source_values[0].text, original_text)
+
     def test_paid_order_requires_payment_date(self) -> None:
         order_data = sample_order().model_dump(mode="python")
         order_data["payment"]["payment_date"] = None

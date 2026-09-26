@@ -37,38 +37,26 @@ class WorkflowStore:
         self.event(checkpoint.run_id, "run_created", {"state": checkpoint.state.value})
 
     def save(self, checkpoint: WorkflowCheckpoint) -> None:
+        try:
+            checkpoint = WorkflowCheckpoint.model_validate(checkpoint.model_dump())
+        except ValueError as exc:
+            raise WorkflowStoreError(f"refusing to save an invalid checkpoint: {exc}") from exc
         folder = self.run_directory(checkpoint.run_id)
         folder.mkdir(parents=True, exist_ok=True)
-        target = folder / "checkpoint.json"
-        rendered = (
-            json.dumps(checkpoint.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n"
+        self._write_json_atomically(
+            folder / "checkpoint.json",
+            checkpoint.model_dump(mode="json"),
+            prefix=".checkpoint-",
+            operation="persist workflow checkpoint",
         )
-        temp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                newline="\n",
-                dir=folder,
-                prefix=".checkpoint-",
-                suffix=".tmp",
-                delete=False,
-            ) as temporary:
-                temp_path = Path(temporary.name)
-                temporary.write(rendered)
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            temp_path.replace(target)
-        except OSError as exc:
-            raise WorkflowStoreError(f"could not persist workflow checkpoint: {exc}") from exc
-        finally:
-            if temp_path is not None and temp_path.exists():
-                temp_path.unlink(missing_ok=True)
 
     def load(self, run_id: str) -> WorkflowCheckpoint:
         path = self.run_directory(run_id) / "checkpoint.json"
         try:
-            return WorkflowCheckpoint.model_validate_json(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "format_version" not in data:
+                data["format_version"] = 1
+            return WorkflowCheckpoint.model_validate(data)
         except FileNotFoundError as exc:
             raise WorkflowStoreError(f"run {run_id!r} was not found") from exc
         except (OSError, ValueError) as exc:
@@ -78,14 +66,40 @@ class WorkflowStore:
         folder = self.run_directory(review.run_id)
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / "review.json"
-        try:
-            path.write_text(
-                json.dumps(review.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            raise WorkflowStoreError(f"could not save review bundle: {exc}") from exc
+        self._write_json_atomically(
+            path,
+            review.model_dump(mode="json"),
+            prefix=".review-",
+            operation="save review bundle",
+        )
         return path
+
+    @staticmethod
+    def _write_json_atomically(
+        path: Path, value: dict[str, Any], *, prefix: str, operation: str
+    ) -> None:
+        rendered = json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+                dir=path.parent,
+                prefix=prefix,
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temp_path = Path(temporary.name)
+                temporary.write(rendered)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            temp_path.replace(path)
+        except OSError as exc:
+            raise WorkflowStoreError(f"could not {operation}: {exc}") from exc
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
 
     def event(self, run_id: str, event: str, details: dict[str, Any] | None = None) -> None:
         path = self.run_directory(run_id) / "events.jsonl"
